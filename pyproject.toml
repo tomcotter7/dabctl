@@ -1,0 +1,25 @@
+[project]
+name = "dabctl"
+version = "0.1.0"
+description = "Databricks CLI Wrapper for DABs"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cachetools>=6.2.1",
+    "typer>=0.20.0",
+]
+
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.3",
+]
+
+[project.scripts]
+dabctl = "dabctl.main:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
