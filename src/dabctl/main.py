@@ -192,9 +192,13 @@ def run(
     )
     if result.returncode != 0:
         logger.error("Command failed: %s" % result.stderr)
+        msg = f"Run failed for job {jobname}"
+        subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
         return
 
     logger.info("Command succesful: %s" % result.stdout)
+    msg = f"Run complete for job {jobname}"
+    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
 
 
 ANSI_ESCAPE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
