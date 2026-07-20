@@ -2,6 +2,8 @@ import json
 import logging
 import re
 import subprocess
+import sys
+import time
 from typing import Optional
 
 import typer
@@ -94,7 +96,12 @@ def current(
 
     data = json.loads(result.stdout)
 
-    tasks = data["resources"]["jobs"][jobname]["tasks"]
+    try:
+        tasks = data["resources"]["jobs"][jobname]["tasks"]
+    except KeyError:
+        logger.error(f"Job '{jobname}' not found in the bundle summary for target '{target}'.")
+        logger.error(f"Available jobs: {list(data['resources']['jobs'].keys())}")
+        return
 
     tasks = {task["task_key"]: {"depends_on": [t["task_key"] for t in task.get("depends_on", [])]} for task in tasks}
     task_keys = build_task_ordering(tasks)
@@ -105,6 +112,7 @@ def current(
 
     workspace = data["workspace"]
 
+    # TODO; This fails if the bundle has never been deployed, we should handle that case gracefully.
     result = subprocess.run(
         ["databricks", "workspace", "list", "--profile", profile, workspace["artifact_path"] + "/.internal"],
         capture_output=True,
@@ -112,7 +120,11 @@ def current(
     )
 
     if result.returncode != 0:
-        logger.error("Command failed: %s" % result.stderr)
+        logger.error(
+            f"Failed to list workspace artifacts at {workspace['artifact_path']}/.internal. "
+            "This may indicate that the bundle has never been deployed to the target. "
+            "Please deploy the bundle first using `dabctl deploy`."
+        )
         return
 
     artifacts = result.stdout
@@ -165,6 +177,138 @@ def complete_tasks(ctx, args, incomplete):
     return [prefix + m for m in matches]
 
 
+POLL_INTERVAL_DEFAULT = 120
+POLL_RETRY_DELAY = 120
+MAX_POLL_RETRIES = 3
+TERMINAL_LIFE_CYCLE_STATES = {"TERMINATED", "INTERNAL_ERROR", "SKIPPED"}
+
+
+def notify(msg: str) -> None:
+    """Fire a macOS desktop notification via osascript."""
+    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
+
+
+def get_run(run_id: str | int) -> dict:
+    """Fetch a job run's details as JSON. Raises RuntimeError if the CLI call fails."""
+    result = subprocess.run(
+        ["databricks", "jobs", "get-run", str(run_id), "--output", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "databricks jobs get-run failed")
+    return json.loads(result.stdout)
+
+
+def run_state(run: dict) -> tuple[Optional[str], Optional[str]]:
+    """Extract (life_cycle_state, result_state) from a run or task dict.
+
+    Handles both the API 2.2 `status` shape and the older 2.1 `state` shape.
+    """
+    status = run.get("status")
+    if status:
+        termination = status.get("termination_details") or {}
+        return status.get("state"), termination.get("code")
+    state = run.get("state") or {}
+    return state.get("life_cycle_state"), state.get("result_state")
+
+
+def parse_run_id(stdout: str, stderr: str) -> Optional[int]:
+    """Pull the run_id out of `databricks bundle run --no-wait` output."""
+    for text in (stdout, stderr):
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and data.get("run_id"):
+            return data["run_id"]
+
+    match = re.search(r"run/(\d+)", f"{stdout or ''}\n{stderr or ''}")
+    return int(match.group(1)) if match else None
+
+
+def format_status_line(run: dict) -> str:
+    """Build a one-line summary of a run's overall state and each task's state."""
+    life_cycle, result_state = run_state(run)
+    overall = result_state or life_cycle or "UNKNOWN"
+    task_states = []
+    for task in run.get("tasks", []):
+        task_life_cycle, task_result = run_state(task)
+        task_states.append(f"{task['task_key']}:{task_result or task_life_cycle or '?'}")
+    timestamp = time.strftime("%H:%M:%S")
+    task_str = " ".join(task_states)
+    return f"[{timestamp}] {overall}" + (f" — {task_str}" if task_str else "")
+
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_FRAME_DELAY = 0.1
+
+
+def emit_status(line: str) -> None:
+    """Show the current status.
+
+    On a TTY, overwrite the previous line in place;
+    otherwise print a fresh line so redirected output stays readable.
+    """
+    if sys.stdout.isatty():
+        print(f"\r\033[2K{line}", end="", flush=True)
+    else:
+        print(line)
+
+
+def spin_wait(seconds: float, status: str) -> None:
+    """Wait `seconds` while animating a spinner next to `status`.
+
+    On a non-TTY the status is printed once and we just sleep, so redirected
+    output gets one line per poll rather than a stream of spinner frames.
+    """
+    if not sys.stdout.isatty():
+        print(status)
+        time.sleep(seconds)
+        return
+
+    frames = max(1, int(seconds / SPINNER_FRAME_DELAY))
+    for i in range(frames):
+        print(f"\r\033[2K{SPINNER_FRAMES[i % len(SPINNER_FRAMES)]} {status}", end="", flush=True)
+        time.sleep(SPINNER_FRAME_DELAY)
+
+
+def poll_until_complete(run_id: str | int, interval: int) -> Optional[dict]:
+    """Poll a run until it reaches a terminal state.
+
+    Returns the final run dict, or None if polling could not recover (in which
+    case the run is likely still active on Databricks).
+    """
+    failures = 0
+    while True:
+        try:
+            run = get_run(run_id)
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            failures += 1
+            if sys.stdout.isatty():
+                print()
+            if failures > MAX_POLL_RETRIES:
+                logger.error("Lost connection while polling run %s: %s", run_id, exc)
+                return None
+            logger.warning(
+                "Poll failed (%s/%s), retrying in %ss: %s", failures, MAX_POLL_RETRIES, POLL_RETRY_DELAY, exc
+            )
+            time.sleep(POLL_RETRY_DELAY)
+            continue
+
+        failures = 0
+        status = format_status_line(run)
+        life_cycle, _ = run_state(run)
+        if life_cycle in TERMINAL_LIFE_CYCLE_STATES:
+            emit_status(status)
+            if sys.stdout.isatty():
+                print()
+            return run
+        spin_wait(interval, status)
+
+
 @app.command()
 def run(
     jobname: Optional[str] = None,
@@ -174,31 +318,66 @@ def run(
         Optional[str],
         typer.Option(help="The tasks to run", autocompletion=complete_tasks),
     ] = None,
+    params: Annotated[
+        Optional[str],
+        typer.Option(
+            help="The parameters to pass to the run, in the format 'key1=value1,key2=value2'",
+        ),
+    ] = None,
+    poll_interval: Annotated[
+        int,
+        typer.Option(help="Seconds between run status polls while waiting for completion"),
+    ] = POLL_INTERVAL_DEFAULT,
 ):
-    """Run specific tasks from a Databricks bundle job."""
+    """Run specific tasks from a Databricks bundle job.
+
+    Triggers the run without holding a long-lived connection open, then polls
+    for completion. A dropped connection retries the poll rather than losing the
+    run, which continues on Databricks regardless.
+    """
     if not jobname or not target or not profile:
         config_values = config.get_current()
         jobname = jobname or config_values["jobname"]
         target = target or config_values["target"]
         profile = profile or config_values["profile"]
 
-    command = ["databricks", "bundle", "run", jobname]
+    command = ["databricks", "bundle", "run", jobname, "--no-wait", "--output", "json"]
     if tasks:
         command = command + ["--only", tasks]
 
-    result = subprocess.run(
-        command,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error("Command failed: %s" % result.stderr)
-        msg = f"Run failed for job {jobname}"
-        subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
+    if params:
+        command = command + ["--params", params]
+
+    trigger = subprocess.run(command, capture_output=True, text=True)
+    if trigger.returncode != 0:
+        logger.error("Failed to trigger run: %s" % trigger.stderr)
+        notify(f"Failed to trigger job {jobname}")
         return
 
-    logger.info("Command succesful: %s" % result.stdout)
-    msg = f"Run complete for job {jobname}"
-    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
+    run_id = parse_run_id(trigger.stdout, trigger.stderr)
+    if not run_id:
+        logger.error(
+            "Triggered run but could not determine run_id from output:\n%s\n%s", trigger.stdout, trigger.stderr
+        )
+        return
+
+    logger.info("Triggered run %s for job %s, polling every %ss...", run_id, jobname, poll_interval)
+
+    final = poll_until_complete(run_id, poll_interval)
+    if final is None:
+        logger.error(
+            "The run is likely still active on Databricks. Resume tracking with: dabctl analyse --run-id %s", run_id
+        )
+        notify(f"Lost track of run {run_id} — check Databricks")
+        return
+
+    _, result_state = run_state(final)
+    if result_state == "SUCCESS":
+        logger.info("Run %s complete: SUCCESS", run_id)
+        notify(f"Run complete for job {jobname}")
+    else:
+        logger.error("Run %s finished: %s. For details: dabctl analyse --run-id %s", run_id, result_state, run_id)
+        notify(f"Run failed for job {jobname}")
 
 
 ANSI_ESCAPE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -233,9 +412,7 @@ def analyse(
         run_id = json.loads(result.stdout)["run_id"]
 
     summary = {}
-    command = ["databricks", "jobs", "get-run", str(run_id), "--output", "json"]
-    result = subprocess.run(command, capture_output=True, text=True)
-    run_output = json.loads(result.stdout)
+    run_output = get_run(run_id)
     summary["status"] = run_output.get("status")
     run_tasks = run_output.get("tasks")
 
