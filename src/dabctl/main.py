@@ -69,7 +69,6 @@ def run_state(run: dict) -> tuple[str | None, str | None, str | None]:
     """Extract (life_cycle_state, result_state) from a run or task dict."""
     # https://docs.databricks.com/api/workspace/jobs/getrun
     status = run.get("status", {})
-    print(status)
     termination = status.get("termination_details", {})
     return status.get("state"), termination.get("code"), termination.get("message")
 
@@ -323,6 +322,10 @@ def run(
             help="The parameters to pass to the run, in the format 'key1=value1,key2=value2'",
         ),
     ] = None,
+    no_poll: Annotated[
+        bool,
+        typer.Option(help="Do not poll for completion, just trigger the run and exit"),
+    ] = False,
     poll_interval: Annotated[
         int,
         typer.Option(help="Seconds between run status polls while waiting for completion"),
@@ -357,8 +360,11 @@ def run(
         )
         return
 
-    logger.info("Triggered run %s for job %s, polling every %ss...", run_id, jobname, poll_interval)
+    if no_poll:
+        print(json.dumps({"run_id": run_id}, indent=2))
+        return
 
+    logger.info("Triggered run %s for job %s, polling every %ss...", run_id, jobname, poll_interval)
     final = poll_until_complete(run_id, poll_interval)
     if final is None:
         logger.error(
@@ -388,6 +394,7 @@ def analyse(
     job_id: Optional[str] = None,
     run_id: Optional[str] = None,
     *,
+    agentic_mode: bool = False,
     show_errors: bool = False,
 ):
     """Analyse the results of a run, defaults to the most recent run if not provided."""
@@ -419,7 +426,7 @@ def analyse(
         error = strip_ansi(data.get("error"))
         error_trace = strip_ansi(data.get("error_trace"))
 
-        if error and error_trace and show_errors:
+        if error and error_trace and show_errors and not agentic_mode:
             print(f"===========Task: {task_key} ({task_run_id})===========")
             print(error)
             print(error_trace)
@@ -439,6 +446,10 @@ def analyse(
             )
 
     summary["tasks"] = tasks_results
+
+    if agentic_mode:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
 
     print(f"A short summary of the run: {run_id}")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
