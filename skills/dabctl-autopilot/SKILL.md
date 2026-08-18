@@ -148,7 +148,7 @@ capacity you are already short of.
 
 | Situation | What to put in `--tasks` | 
 |---|---|
-| Infra failure | The failed task and every task after it. Nothing changed, so completed output stays valid. 
+| Infra failure | The failed task and every task after it. Nothing changed, so completed output stays valid. |
 | Fix touches only the failed task's code | The failed task and every task after it. |
 | Fix touches code a completed task also runs | The full original list. |
 

@@ -21,13 +21,9 @@ zstyle ':autocomplete:*' insert-unambiguous no
 
 ## Claude Code skill
 
-`skills/dabctl-autopilot/` is a Claude Code skill that drives `dabctl` autonomously: deploy, run,
-diagnose failures from task tracebacks, fix code/config/dependency issues, and iterate until the run
-is green. It retries capacity failures (no GPU) without spending its fix budget, and stops rather
-than touching data or permissions.
+`skills/dabctl-autopilot/` is a Claude Code skill that drives `dabctl` autonomously: deploy, run, diagnose failures from task tracebacks, fix code/config/dependency issues, and iterate until the run is green. It retries capacity failures (no GPU) without spending its fix budget, and stops rather than touching data or permissions.
 
-Skills load from `~/.claude/skills/`, but you use `dabctl` from inside your bundle project rather
-than from this repo, so install it as a personal skill via symlink:
+Skills load from `~/.claude/skills/`, but you use `dabctl` from inside your bundle project rather than from this repo, so install it as a personal skill via symlink:
 
 ```bash
 ln -sfn "$PWD/skills/dabctl-autopilot" ~/.claude/skills/dabctl-autopilot
