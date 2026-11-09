@@ -29,8 +29,6 @@ Skills load from `~/.claude/skills/`, but you use `dabctl` from inside your bund
 ln -sfn "$PWD/skills/dabctl-autopilot" ~/.claude/skills/dabctl-autopilot
 ```
 
-Claude picks it up automatically when you ask it to run or debug a bundle.
-
 ### Run it in auto mode
 
 Run the skill in Claude Code's **auto mode**. The loop runs unattended for minutes to hours, so a

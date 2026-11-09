@@ -1,22 +1,32 @@
 import json
 import os
+import subprocess
 
-CONFIG_FILE = os.path.expanduser("~/.config/.dabctl.json")
+
+def config_file():
+    """Config path, separate per tmux session when inside tmux."""
+    if os.environ.get("TMUX"):
+        session = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True, text=True).stdout.strip()
+        if session:
+            return os.path.expanduser(f"~/.config/.dabctl-{session}.json")
+    return os.path.expanduser("~/.config/.dabctl.json")
 
 
 def load_config():
     """Load config from JSON file."""
-    if not os.path.exists(CONFIG_FILE):
+    path = config_file()
+    if not os.path.exists(path):
         return {}
 
-    with open(CONFIG_FILE, "r") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 
 def save_config(config):
     """Save config to JSON file."""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    path = config_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump(config, f, indent=2)
 
 

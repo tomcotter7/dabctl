@@ -53,10 +53,11 @@ def notify(msg: str) -> None:
     subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
 
 
-def get_run(run_id: str | int) -> dict:
+def get_run(run_id: str | int, profile: Optional[str] = None) -> dict:
     """Fetch a job run's details as JSON. Raises RuntimeError if the CLI call fails."""
+    profile = profile or config.get_current().get("profile")
     result = subprocess.run(
-        ["databricks", "jobs", "get-run", str(run_id), "--output", "json"],
+        ["databricks", "jobs", "get-run", str(run_id), "--output", "json", "--profile", profile],
         capture_output=True,
         text=True,
     )
@@ -134,8 +135,12 @@ def spin_wait(seconds: float, status: str) -> None:
         time.sleep(SPINNER_FRAME_DELAY)
 
 
-def poll_until_complete(run_id: str | int, interval: int) -> dict | None:
-    """Poll a run until it reaches a terminal state."""
+def poll_until_complete(run_id: str | int, max_interval: int) -> dict | None:
+    """Poll a run until it reaches a terminal state.
+
+    interval increases over time to avoid hammering the API.
+    """
+    current_interval = 1
     failures = 0
     while True:
         try:
@@ -161,7 +166,8 @@ def poll_until_complete(run_id: str | int, interval: int) -> dict | None:
             if sys.stdout.isatty():
                 print()
             return run
-        spin_wait(interval, status)
+        spin_wait(current_interval, status)
+        current_interval = min(current_interval * 1.5, max_interval)
 
 
 def build_task_ordering(tasks: dict, ordered_task_names: list[str] = []) -> list[str]:
@@ -209,24 +215,6 @@ def current(
         logger.error("jobname, target, and profile must be set. Use 'dabctl set' command first.")
         return
 
-    if not job_id:
-        result = subprocess.run(
-            ["databricks", "jobs", "list", "--output", "json"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        jobs = json.loads(result.stdout)
-        matches = [(j.get("job_id"), jn) for j in jobs if jobname in (jn := j.get("settings", {}).get("name", ""))]
-        if len(matches) > 1:
-            print("No `job_id` set, we've found multiple possibilities, which of these is your job ID?")
-            print(json.dumps(matches, indent=2))
-            job_id_idx = int(input(f"Press 1 - {len(matches)}: "))
-            job_id = matches[job_id_idx - 1][0]
-        else:
-            job_id = matches[0][0]
-
     result = subprocess.run(
         ["databricks", "bundle", "summary", "--output", "json", "--target", target],
         capture_output=True,
@@ -242,11 +230,35 @@ def current(
     data = json.loads(result.stdout)
 
     try:
-        tasks = data["resources"]["jobs"][jobname]["tasks"]
+        job = data["resources"]["jobs"][jobname]
+        tasks = job["tasks"]
     except KeyError:
         logger.error(f"Job '{jobname}' not found in the bundle summary for target '{target}'.")
         logger.error(f"Available jobs: {list(data['resources']['jobs'].keys())}")
         return
+
+    if not job_id:
+        # The summary holds the deployed name (with any "[dev user]" prefix), so we can filter server-side.
+        result = subprocess.run(
+            ["databricks", "jobs", "list", "--output", "json", "--name", job["name"]],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("Got no `job_id` set, looking up job ID for job name '%s'..." % job["name"])
+
+        jobs = json.loads(result.stdout)
+        matches = [(j.get("job_id"), j.get("settings", {}).get("name", "")) for j in jobs]
+        if not matches:
+            logger.error(f"No deployed job named '{job['name']}'. Deploy it first using `dabctl deploy`.")
+            return
+        if len(matches) > 1:
+            print("No `job_id` set, we've found multiple possibilities, which of these is your job ID?")
+            print(json.dumps(matches, indent=2))
+            job_id_idx = int(input(f"Press 1 - {len(matches)}: "))
+            job_id = matches[job_id_idx - 1][0]
+        else:
+            job_id = matches[0][0]
 
     tasks = {task["task_key"]: {"depends_on": [t["task_key"] for t in task.get("depends_on", [])]} for task in tasks}
     task_keys = build_task_ordering(tasks)
@@ -305,6 +317,41 @@ def deploy(
         return
 
     logger.info("Command succesful")
+
+
+@app.command()
+def reattach(
+    run_id: str,
+    jobname: Optional[str] = None,
+    target: Optional[str] = None,
+    profile: Optional[str] = None,
+):
+    """Resume tracking an existing run until it completes."""
+    if not jobname or not target or not profile:
+        config_values = config.get_current()
+        jobname = jobname or config_values["jobname"]
+        target = target or config_values["target"]
+        profile = profile or config_values["profile"]
+
+    logger.info("Reattaching to run %s for job %s...", run_id, jobname)
+    final = poll_until_complete(run_id, POLL_INTERVAL_DEFAULT)
+    if final is None:
+        logger.error(
+            "The run is likely still active on Databricks. Resume tracking with: dabctl analyse --run-id %s", run_id
+        )
+        notify(f"Lost track of run {run_id} — check Databricks")
+        return
+    _, termination_details, state_msg = run_state(final)
+    if termination_details == "SUCCESS":
+        logger.info("Run %s complete: SUCCESS", run_id)
+        notify(f"Run complete for job {jobname}")
+    else:
+        message = f"Run {run_id} finished: {termination_details}."
+        if state_msg:
+            message += f" See state message: {state_msg}."
+        message += f" For details:\ndabctl analyse --run-id {run_id}"
+        logger.error(message)
+        notify(f"Run failed for job {jobname} with error {termination_details}.")
 
 
 @app.command()
