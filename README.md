@@ -16,8 +16,15 @@ zstyle ':autocomplete:*' insert-unambiguous no
 ## Installation
 
 - Run `uv sync`
-- Create a symlink to the resulting binary (`.venv/bin/dabctl`) to ensure it's on your path.
+- Create a symlink to the resulting binary (`.venv/bin/dabctl`) in a directory on your path. Run this from the repo root:
+
+```bash
+ln -sfn "$PWD/.venv/bin/dabctl" ~/.local/bin/dabctl
+```
+
 - Run `dabctl --help` to ensure that it works.
+
+The link target must be an absolute path. If you use a relative path such as `.venv/bin/dabctl`, the link breaks and you get `command not found`.
 
 ## Claude Code skill
 
