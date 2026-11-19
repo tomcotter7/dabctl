@@ -50,7 +50,10 @@ def complete_tasks(ctx, args, incomplete):
 
 def notify(msg: str) -> None:
     """Fire a macOS desktop notification via osascript."""
-    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "dabctl"'])
+    # pass msg via argv so quotes in it can't break the AppleScript
+    subprocess.run(
+        ["osascript", "-e", "on run argv", "-e", 'display notification (item 1 of argv) with title "dabctl"', "-e", "end run", msg]
+    )
 
 
 def get_run(run_id: str | int, profile: Optional[str] = None) -> dict:
@@ -86,7 +89,7 @@ def parse_run_id(stdout: str, stderr: str) -> Optional[int]:
         if isinstance(data, dict) and data.get("run_id"):
             return data["run_id"]
 
-    match = re.search(r"run/(\d+)", f"{stdout or ''}\n{stderr or ''}")
+    match = re.search(r"runs?/(\d+)", f"{stdout or ''}\n{stderr or ''}")
     return int(match.group(1)) if match else None
 
 
@@ -405,6 +408,7 @@ def run(
         logger.error(
             "Triggered run but could not determine run_id from output:\n%s\n%s", trigger.stdout, trigger.stderr
         )
+        notify(f"Triggered job {jobname} but lost its run ID — check Databricks")
         return
 
     if no_poll:
